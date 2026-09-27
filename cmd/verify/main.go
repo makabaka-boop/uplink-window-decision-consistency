@@ -11,7 +11,8 @@
 //     或“待处理且已结算”的组合；失败传播期间下游不呈现虚假可执行状态；
 //  7. 实例时钟偏移：两台时钟分别偏移 ±1 小时的实例对同一凭证给出相同裁决；
 //  8. 执行截止时刻：过窗跳过领取、截止后回执/到期结算互斥、expired 无回执结算、
-//     后继阻断、重复结算不产生第二行、重启保持。
+//     后继阻断、重复结算不产生第二行、重启保持；回执/到期结算在指令行锁队列
+//     等待期间跨过截止点时，裁决以拿到锁之后的数据库时钟为准。
 //
 // 退出码 0 表示全部通过；任何断言失败都会打印详细错误并以非零退出。
 package main
@@ -206,6 +207,12 @@ func (v *verifier) run(ctx context.Context) error {
 
 	// 执行截止时刻：到期结算、领取跳过、回执竞态、后继阻断与重启保持。
 	if err := v.checkDeadlines(ctx); err != nil {
+		return err
+	}
+
+	// 锁等待跨窗裁决：回执/到期结算在指令行锁队列中等待期间跨过截止点，
+	// 裁决以拿到锁之后的数据库时钟为准，终态不因请求等待顺序而改变。
+	if err := v.checkDeadlineLockQueue(ctx); err != nil {
 		return err
 	}
 
@@ -1205,6 +1212,121 @@ func (v *verifier) checkDeadlines(ctx context.Context) error {
 		}
 	}
 	fmt.Println("deadline checks passed (expiry settlement, ack/expire arbitration, successor blocking, restart)")
+	return nil
+}
+
+// checkDeadlineLockQueue 验收“锁等待跨窗裁决”：回执/到期结算恰好跨过时间边界——
+// 请求入队（事务开始）时尚未过窗，但在指令行锁队列中等待期间数据库时钟跨过
+// 执行截止点。裁决必须以拿到行锁之后的数据库时钟为准：
+//   - 过窗回执 409 deadline_reached，状态保持 pending，随后到期结算接管为 expired；
+//   - 过窗到期结算照常 200 expired（不得 409 deadline_not_reached）；
+//
+// 回执、到期结算与详情查询呈现同一次有效裁决，过窗指令的终态不因请求在锁
+// 队列中的等待顺序而改变。
+func (v *verifier) checkDeadlineLockQueue(ctx context.Context) error {
+	pool, err := pgxpool.New(ctx, v.dbURL)
+	if err != nil {
+		return fmt.Errorf("db connect: %w", err)
+	}
+	defer pool.Close()
+
+	// 等待对方事务进入行锁等待（证明其已在截止点之前入队）。
+	waitQueued := func() error {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			var waiting int
+			if err := pool.QueryRow(ctx, `
+				SELECT count(*) FROM pg_locks
+				WHERE NOT granted AND locktype IN ('tuple','transactionid')`).Scan(&waiting); err == nil && waiting > 0 {
+				return nil
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return fail("queued request never reached the lock-wait state")
+	}
+	// 旁观者事务持锁，制造一次短暂的指令锁等待。
+	holdRowLock := func(id int64) (func(), error) {
+		holder, err := pool.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := holder.Exec(ctx, `SELECT 1 FROM commands WHERE id=$1 FOR UPDATE`, id); err != nil {
+			holder.Rollback(ctx)
+			return nil, err
+		}
+		return func() { holder.Commit(ctx) }, nil
+	}
+	type httpResult struct {
+		status int
+		raw    []byte
+	}
+
+	// a) 回执在锁等待期间跨过截止点：必须 409 deadline_reached，状态不变。
+	queued := v.createCommandWithDeadline(ctx, map[string]any{"d": "queued-ack"},
+		time.Now().Add(400*time.Millisecond))
+	st, raw := v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK {
+		return fail("claim queued-ack: status=%d body=%s", st, raw)
+	}
+	queuedClaim := decode[claimOut](raw)
+	if queuedClaim.CommandID != queued.ID {
+		return fail("claim got %d want queued-ack %d", queuedClaim.CommandID, queued.ID)
+	}
+
+	release, err := holdRowLock(queued.ID)
+	if err != nil {
+		return fmt.Errorf("holder lock: %w", err)
+	}
+	ackCh := make(chan httpResult, 1)
+	go func() {
+		st, raw := v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", queued.ID),
+			map[string]any{"lease_token": queuedClaim.LeaseToken, "result": "delivered"})
+		ackCh <- httpResult{st, raw}
+	}()
+	if err := waitQueued(); err != nil {
+		return err
+	}
+	time.Sleep(600 * time.Millisecond) // 数据库时钟明确跨过截止点（400ms）
+	release()
+	ackRes := <-ackCh
+	if ackRes.status != http.StatusConflict ||
+		decode[apiError](ackRes.raw).Error.Code != "deadline_reached" {
+		return fail("ack queued across deadline: status=%d body=%s, want 409 deadline_reached",
+			ackRes.status, ackRes.raw)
+	}
+	if got := v.getCommand(ctx, queued.ID); got.Status != "pending" || got.Settlement != nil {
+		return fail("queued ack past deadline changed state: %+v", got)
+	}
+	// 同一交接下，到期结算随后接管为 expired。
+	st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/expire", queued.ID), nil)
+	if st != http.StatusOK || decode[commandOut](raw).Status != "expired" {
+		return fail("expire after queued ack: status=%d body=%s", st, raw)
+	}
+
+	// b) 到期结算在锁等待期间跨过截止点：必须照常 200 expired，
+	//    不得把已经过窗的指令误判为“尚未到期”。
+	queuedExp := v.createCommandWithDeadline(ctx, map[string]any{"d": "queued-expire"},
+		time.Now().Add(400*time.Millisecond))
+	release2, err := holdRowLock(queuedExp.ID)
+	if err != nil {
+		return fmt.Errorf("holder2 lock: %w", err)
+	}
+	expCh := make(chan httpResult, 1)
+	go func() {
+		st, raw := v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/expire", queuedExp.ID), nil)
+		expCh <- httpResult{st, raw}
+	}()
+	if err := waitQueued(); err != nil {
+		return err
+	}
+	time.Sleep(600 * time.Millisecond)
+	release2()
+	expRes := <-expCh
+	if expRes.status != http.StatusOK || decode[commandOut](expRes.raw).Status != "expired" {
+		return fail("expire queued across deadline must settle expired: status=%d body=%s",
+			expRes.status, expRes.raw)
+	}
+	fmt.Println("deadline lock-queue checks passed (verdicts use the post-lock database clock)")
 	return nil
 }
 

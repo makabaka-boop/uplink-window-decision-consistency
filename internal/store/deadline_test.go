@@ -559,3 +559,157 @@ func TestExpiredPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("expired chain claimable after restart: %v", err)
 	}
 }
+
+// holdRowLock 开一个事务锁住指定指令行（模拟“短暂的指令锁等待”的旁观者），
+// 返回释放函数：调用即提交旁观者事务、释放行锁。
+func holdRowLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context, id int64) func() {
+	t.Helper()
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Exec(ctx, `SELECT 1 FROM commands WHERE id=$1 FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if err := holder.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestAckQueuedAcrossDeadlineCannotDeliver 回执在指令行锁队列中等待期间跨过执行
+// 截止点：请求入队（事务开始）时尚未过窗，但拿到行锁时截止点已过。
+// 裁决必须以拿到锁之后的数据库时钟为准——回执 ErrDeadlineReached、状态不变，
+// 随后到期结算接管为 expired；回执、到期结算与详情视图呈现同一次有效裁决，
+// 过窗指令的终态不因请求在锁队列中的等待顺序而改变。
+func TestAckQueuedAcrossDeadlineCannotDeliver(t *testing.T) {
+	pool, _ := openTestDB(t)
+	st := store.New(pool)
+	ctx := context.Background()
+
+	c := createWithDeadline(t, st, `{"queued":"ack"}`, dbNow(t, pool).Add(350*time.Millisecond))
+	// 5s 长租约：排除“租期本身到期”的干扰，锁定变量为执行截止点。
+	cl, err := st.Claim(ctx, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cl.CommandID != c.ID {
+		t.Fatalf("claim got %d want %d", cl.CommandID, c.ID)
+	}
+
+	release := holdRowLock(t, pool, ctx, c.ID)
+	ackErr := make(chan error, 1)
+	go func() {
+		ackErr <- st.Ack(ctx, c.ID, cl.LeaseToken, store.StatusDelivered)
+	}()
+	waitForLockWait(t, pool, "commands", c.ID) // 回执已在锁队列中等待（事务已在截止点前开始）
+	time.Sleep(500 * time.Millisecond)         // 数据库时钟明确跨过截止点（350ms）
+	release()
+
+	if err := <-ackErr; !errors.Is(err, store.ErrDeadlineReached) {
+		t.Fatalf("ack adjudicated after deadline: want ErrDeadlineReached, got %v", err)
+	}
+	d, _ := st.GetCommand(ctx, c.ID)
+	if d.Status != store.StatusPending || d.Settlement != nil {
+		t.Fatalf("queued ack past deadline changed state: %+v", d)
+	}
+	// 同一交接下，到期结算随后接管：终态 expired（无回执结算），与现场时间线一致。
+	if err := st.Expire(ctx, c.ID); err != nil {
+		t.Fatalf("expire after queued ack: %v", err)
+	}
+	d, _ = st.GetCommand(ctx, c.ID)
+	if d.Status != store.StatusExpired || d.Settlement == nil ||
+		d.Settlement.Result != store.StatusExpired || d.Settlement.Generation != nil {
+		t.Fatalf("expire after queued ack: %+v", d)
+	}
+}
+
+// TestExpireQueuedAcrossDeadlineSettles 到期结算在指令行锁队列中等待期间跨过
+// 截止点：入队（事务开始）时未到点，拿到行锁时截止点已过。必须按“已到点”
+// 裁决——原子落 expired（无回执结算）、后继链 blocked（根因=到期根）；
+// 绝不把已经过窗的指令误判为“尚未到期”，留下与现场时间线对不上的 pending。
+func TestExpireQueuedAcrossDeadlineSettles(t *testing.T) {
+	pool, _ := openTestDB(t)
+	st := store.New(pool)
+	ctx := context.Background()
+
+	root := createWithDeadline(t, st, `{"queued":"expire"}`, dbNow(t, pool).Add(350*time.Millisecond))
+	child, err := st.CreateCommand(ctx, []byte(`{"n":1}`), pid(root.ID), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release := holdRowLock(t, pool, ctx, root.ID)
+	expireErr := make(chan error, 1)
+	go func() {
+		expireErr <- st.Expire(ctx, root.ID)
+	}()
+	waitForLockWait(t, pool, "commands", root.ID) // 到期结算已在锁队列中等待
+	time.Sleep(500 * time.Millisecond)            // 数据库时钟明确跨过截止点（350ms）
+	release()
+
+	if err := <-expireErr; err != nil {
+		t.Fatalf("expire adjudicated after deadline must settle, got %v", err)
+	}
+	d, _ := st.GetCommand(ctx, root.ID)
+	if d.Status != store.StatusExpired || d.Settlement == nil ||
+		d.Settlement.Result != store.StatusExpired || d.Settlement.Generation != nil {
+		t.Fatalf("queued expire across deadline: %+v", d)
+	}
+	// 前驱阻断与到期结算是同一次裁决：后继 blocked，blocked_by=到期根，无租约无结算。
+	cd, _ := st.GetCommand(ctx, child.ID)
+	if cd.Status != store.StatusBlocked || cd.BlockedBy == nil || *cd.BlockedBy != root.ID {
+		t.Fatalf("successor not blocked by expired root: %+v", cd.Command)
+	}
+	if len(cd.Leases) != 0 || cd.Settlement != nil {
+		t.Fatalf("blocked successor fabricated leases=%d settlement=%+v", len(cd.Leases), cd.Settlement)
+	}
+}
+
+// TestAckQueuedAcrossLeaseExpiryCannotDeliver 回执在指令行锁队列中等待期间租约
+// 到期：入队（事务开始）时租约尚有效，拿到行锁时租约已失效。已经失效的租约
+// 不能把指令确认送达——裁决 ErrLeaseStale、状态不变；该指令随后可被重新领取
+// （代次推进），证明未发生任何结算，终态不因请求等待顺序而改变。
+func TestAckQueuedAcrossLeaseExpiryCannotDeliver(t *testing.T) {
+	pool, _ := openTestDB(t)
+	st := store.New(pool)
+	ctx := context.Background()
+
+	c, err := st.CreateCommand(ctx, []byte(`{"queued":"lease"}`), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := st.Claim(ctx, 300*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cl.CommandID != c.ID {
+		t.Fatalf("claim got %d want %d", cl.CommandID, c.ID)
+	}
+
+	release := holdRowLock(t, pool, ctx, c.ID)
+	ackErr := make(chan error, 1)
+	go func() {
+		ackErr <- st.Ack(ctx, c.ID, cl.LeaseToken, store.StatusDelivered)
+	}()
+	waitForLockWait(t, pool, "commands", c.ID) // 回执已入队（其事务在租约有效期内开始）
+	time.Sleep(450 * time.Millisecond)         // 租约（300ms）明确到期
+	release()
+
+	if err := <-ackErr; !errors.Is(err, store.ErrLeaseStale) {
+		t.Fatalf("ack adjudicated after lease expiry: want ErrLeaseStale, got %v", err)
+	}
+	d, _ := st.GetCommand(ctx, c.ID)
+	if d.Status != store.StatusPending || d.Settlement != nil {
+		t.Fatalf("expired-lease ack changed state: %+v", d)
+	}
+	// 租约确已到期且未发生结算：指令可被重新领取，代次推进到 2。
+	re, err := st.Claim(ctx, time.Second)
+	if err != nil {
+		t.Fatalf("reclaim after expired lease: %v", err)
+	}
+	if re.CommandID != c.ID || re.Generation != 2 {
+		t.Fatalf("reclaim got id=%d gen=%d, want id=%d gen=2", re.CommandID, re.Generation, c.ID)
+	}
+}

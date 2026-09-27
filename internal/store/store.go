@@ -56,9 +56,12 @@ type Store struct {
 	pool *pgxpool.Pool
 	// now 是实例本地时钟的测试注入点（见 NewWithClock）。
 	// 注意：租约有效性等一切裁决都以数据库时钟为准（到期时间写入、领取侧
-	// 到期判定、回执侧有效性判定共用同一时钟域），实例本地时钟不参与裁决——
-	// 该注入点存在的唯一目的是让回归测试能验证“实例时钟偏移不改变裁决结论”，
-	// 若有人重新把实例时钟引入裁决，带偏移的验收测试会立即失败。
+	// 到期判定、回执侧有效性判定共用同一时钟域），且裁决时刻是在拿到指令
+	// 行锁之后读取的数据库真实时钟（clock_timestamp()）——锁等待期间跨过
+	// 到期点/截止点的请求按裁决时刻判定，不按入队时刻判定；实例本地时钟
+	// 不参与裁决。该注入点存在的唯一目的是让回归测试能验证“实例时钟偏移
+	// 不改变裁决结论”，若有人重新把实例时钟引入裁决，带偏移的验收测试会
+	// 立即失败。
 	now func() time.Time
 }
 
@@ -261,9 +264,12 @@ func (s *Store) CreateCommand(ctx context.Context, payload []byte, predecessorID
 //     施加，而非先在递归 CTE 中物化候选再加锁（后者在高并发下会放过同一行）；
 //   - FOR UPDATE SKIP LOCKED 保证并发领取者各自拿到不同的行（唯一领取）；
 //   - 前驱尚未送达的指令只能等待，绝不预发租约；
-//   - 已过执行截止点（deadline_at <= now()，数据库时钟）的指令被跳过：过窗的
+//   - 已过执行截止点（deadline_at <= 裁决时刻，数据库时钟）的指令被跳过：过窗的
 //     准备动作不能再被领取，其状态由针对该指令的到期结算另行原子裁决；
 //   - 未填写截止时刻的指令不受该谓词影响，领取顺序与旧行为完全一致；
+//   - 所有时间判定与租约到期时间的写入都使用语句执行时刻的数据库真实时钟
+//     （clock_timestamp()，而非事务开始时钟 now()）：即使本事务在连接/锁上
+//     有过等待，发放的租约与扫描资格仍锚定真正发放租约的那一刻；
 //   - 在同一事务内推进 lease_generation 并写入新一代租约。
 func (s *Store) Claim(ctx context.Context, leaseFor time.Duration) (*Claim, error) {
 	tx, err := s.pool.Begin(ctx)
@@ -277,8 +283,8 @@ func (s *Store) Claim(ctx context.Context, leaseFor time.Duration) (*Claim, erro
 		SELECT c.id
 		FROM commands c
 		WHERE c.status = 'pending'
-		  AND (c.lease_expires_at IS NULL OR c.lease_expires_at <= now())
-		  AND (c.deadline_at IS NULL OR c.deadline_at > now())
+		  AND (c.lease_expires_at IS NULL OR c.lease_expires_at <= clock_timestamp())
+		  AND (c.deadline_at IS NULL OR c.deadline_at > clock_timestamp())
 		  AND NOT EXISTS (
 				SELECT 1
 				FROM command_closure k
@@ -306,8 +312,8 @@ func (s *Store) Claim(ctx context.Context, leaseFor time.Duration) (*Claim, erro
 		UPDATE commands
 		SET lease_generation = lease_generation + 1,
 		    lease_token      = $2,
-		    lease_expires_at = now() + ($3::bigint * interval '1 microsecond'),
-		    updated_at       = now()
+		    lease_expires_at = clock_timestamp() + ($3::bigint * interval '1 microsecond'),
+		    updated_at       = clock_timestamp()
 		WHERE id = $1
 		RETURNING lease_generation, lease_expires_at`,
 		id, token, leaseFor.Microseconds(),
@@ -317,8 +323,8 @@ func (s *Store) Claim(ctx context.Context, leaseFor time.Duration) (*Claim, erro
 	}
 
 	if _, err = tx.Exec(ctx, `
-		INSERT INTO leases (command_id, generation, lease_token, expires_at)
-		VALUES ($1, $2, $3, $4)`,
+		INSERT INTO leases (command_id, generation, lease_token, expires_at, claimed_at)
+		VALUES ($1, $2, $3, $4, clock_timestamp())`,
 		id, gen, token, expiresAt); err != nil {
 		return nil, fmt.Errorf("claim lease insert: %w", err)
 	}
@@ -336,9 +342,15 @@ func (s *Store) Claim(ctx context.Context, leaseFor time.Duration) (*Claim, erro
 // blocked 终态并记录阻断来源；blocked 指令不写租约、不写结算。
 // result=delivered 仅结算自身，随后继之而来的后继由领取查询自动解锁。
 //
-// 截止点裁决：若指令填写了 deadline_at，回执只在数据库时钟仍早于截止点
-// （deadline_at > now()）时有效；过窗后即使令牌属于当前代次、租期未到，
-// 也只能由到期结算接管（ErrDeadlineReached），截止前的成功送达不可被追改。
+// 截止点裁决：若指令填写了 deadline_at，回执只在数据库时钟仍早于截止点时
+// 有效；过窗后即使令牌属于当前代次、租期未到，也只能由到期结算接管
+// （ErrDeadlineReached），截止前的成功送达不可被追改。
+//
+// 裁决时刻：回执事务可能先在指令行锁上排队（另一裁决/创建事务持锁），
+// 等待期间数据库时钟仍在走——入队时尚未过窗，拿到锁时租约或截止点可能
+// 已经跨过。因此一切时间判定都使用拿到行锁之后读取的数据库真实时钟
+// （clock_timestamp()），且租约有效性判定与截止点判定共用这同一个裁决
+// 时刻：一次有效裁决，不因请求在锁队列中的等待顺序而改变结论。
 func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	if !ValidResults[result] {
 		// 双保险：HTTP 层已拦截，存储层不接受任何越界值。
@@ -351,14 +363,15 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	}
 	defer tx.Rollback(ctx)
 
+	// 首步即取指令行锁：与任何在途的领取/回执/到期/创建事务串行化。
 	var status string
 	var currentGen int64
-	var deadlineOpen bool
+	var deadlineAt *time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT status, lease_generation, (deadline_at IS NULL OR deadline_at > now())
+		SELECT status, lease_generation, deadline_at
 		FROM commands
 		WHERE id = $1
-		FOR UPDATE`, id).Scan(&status, &currentGen, &deadlineOpen)
+		FOR UPDATE`, id).Scan(&status, &currentGen, &deadlineAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrCommandNotFound
 	}
@@ -366,27 +379,36 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 		return fmt.Errorf("ack load command: %w", err)
 	}
 
+	// 裁决时刻：拿到行锁之后的数据库真实时钟。不能用事务开始时钟 now()——
+	// 它冻结在 BEGIN 时刻，会把锁等待期间已经跨过租约到期点/执行截止点的
+	// 请求按入队时刻误判（已失效租约被送达、过窗指令被确认）。
+	var adjudgedAt time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&adjudgedAt); err != nil {
+		return fmt.Errorf("ack adjudication clock: %w", err)
+	}
+
 	// 裁决顺序（行锁内，无并发可改写状态）：
 	// 1) 已在终态（delivered/failed/expired，以及失败/到期传播产生的只读 blocked）：
 	//    一律拒绝重复结算/覆盖——先于令牌裁决，保证 blocked 指令不可能因任何令牌被改写；
 	// 2) 令牌从未对该指令签发；
 	// 3) 令牌非当前代次：旧持有者迟到；
-	// 4) 令牌已过期：租约到期（以数据库时钟判定，与实例本地时钟无关）；
+	// 4) 令牌已过期：租约到期（以裁决时刻的数据库时钟判定，与实例本地时钟无关）；
 	// 5) 数据库时钟已过执行截止点：旧租约即使尚未达到自身租期也不能送达。
 	if status != StatusPending {
 		return ErrAlreadySettled
 	}
 
 	// 令牌必须是系统签发过、且属于本指令的（其他指令的令牌视为从未签发）。
-	// 有效期裁决直接使用数据库时钟（expires_at > now()）：到期时间的写入
-	// 与领取侧的到期判定都使用数据库时钟，时钟域唯一。多实例部署时各实例
-	// 本地时钟可能有偏差，只有数据库时钟能在所有实例上给出相同结论。
+	// 有效期裁决使用拿到行锁后读取的裁决时刻（expires_at > 裁决时刻）：
+	// 到期时间的写入、领取侧的到期判定与这里的回执侧判定同属数据库时钟域，
+	// 多实例部署时各实例本地时钟可能有偏差，只有数据库时钟能在所有实例上
+	// 给出相同结论。
 	var leaseGen int64
 	var leaseLive bool
 	err = tx.QueryRow(ctx, `
-		SELECT generation, (expires_at > now())
+		SELECT generation, (expires_at > $2)
 		FROM leases
-		WHERE lease_token = $1 AND command_id = $2`, token, id).Scan(&leaseGen, &leaseLive)
+		WHERE lease_token = $1 AND command_id = $3`, token, adjudgedAt, id).Scan(&leaseGen, &leaseLive)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrInvalidLeaseToken
 	}
@@ -400,24 +422,26 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	if !leaseLive {
 		return ErrLeaseStale
 	}
-	// 截止点判定与租约有效期判定共用同一数据库时钟、同一行锁：过窗后
+	// 截止点判定与租约有效期判定共用同一裁决时刻、同一行锁：过窗后
 	// 回执与到期结算互斥，谁先在行锁内落地，另一个只能看到终态。
-	if !deadlineOpen {
+	if deadlineAt != nil && !deadlineAt.After(adjudgedAt) {
 		return ErrDeadlineReached
 	}
 
 	// settlements.command_id 主键兜底：即使上层有漏洞也无法二次结算。
+	// settled_at 记录本次裁决时刻：回执、阻断传播与详情视图呈现同一次
+	// 有效裁决，现场时间线可与详情查询对账。
 	if _, err = tx.Exec(ctx, `
-		INSERT INTO settlements (command_id, generation, lease_token, result)
-		VALUES ($1, $2, $3, $4)`,
-		id, currentGen, token, result); err != nil {
+		INSERT INTO settlements (command_id, generation, lease_token, result, settled_at)
+		VALUES ($1, $2, $3, $4, $5)`,
+		id, currentGen, token, result, adjudgedAt); err != nil {
 		return fmt.Errorf("ack settlement insert: %w", err)
 	}
 
 	if _, err = tx.Exec(ctx, `
 		UPDATE commands
-		SET status = $2, updated_at = now()
-		WHERE id = $1 AND status = 'pending'`, id, result); err != nil {
+		SET status = $2, updated_at = $3
+		WHERE id = $1 AND status = 'pending'`, id, result, adjudgedAt); err != nil {
 		return fmt.Errorf("ack status update: %w", err)
 	}
 
@@ -433,9 +457,9 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 				SELECT c.id FROM commands c JOIN descendants d ON c.predecessor_id = d.did
 			)
 			UPDATE commands
-			SET status = 'blocked', blocked_by = $1, updated_at = now()
+			SET status = 'blocked', blocked_by = $1, updated_at = $2
 			WHERE id IN (SELECT did FROM descendants)
-			  AND status = 'pending'`, id); err != nil {
+			  AND status = 'pending'`, id, adjudgedAt); err != nil {
 			return fmt.Errorf("ack block propagation: %w", err)
 		}
 	}
@@ -443,17 +467,22 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	return tx.Commit(ctx)
 }
 
-// Expire 对指定指令执行到期结算：仅当数据库时钟已到达截止点
-// （deadline_at <= now()）且指令尚未送达（仍为 pending）时，在同一行锁内
-// 原子地把它置为 expired 终态，并按现有前驱闭包规则把尚未送达的整条后继链
-// 原子转为 blocked（blocked_by 记录到期根编号，即到期根因）。
+// Expire 对指定指令执行到期结算：仅当数据库时钟已到达截止点且指令尚未送达
+// （仍为 pending）时，在同一行锁内原子地把它置为 expired 终态，并按现有
+// 前驱闭包规则把尚未送达的整条后继链原子转为 blocked（blocked_by 记录
+// 到期根编号，即到期根因）。
+//
+// 裁决时刻与 Ack 同一规则：到期事务可能先在指令行锁上排队，等待期间
+// 数据库时钟仍在走——入队时未到点，拿到锁时截止点可能已经到达。因此
+// 到点判定使用拿到行锁之后读取的数据库真实时钟（clock_timestamp()），
+// 绝不把已经过窗的指令误判为“尚未到期”而留下无法对账的 pending。
 //
 // 裁决顺序与 Ack 共用同一把行锁，互斥成立：
 //   - 指令不存在 → ErrCommandNotFound；
 //   - 已在终态（delivered/failed/blocked/expired）→ ErrAlreadySettled：
 //     截止前的成功送达不可被追改；重复到期结算也在这里被吸收，
 //     绝不会制造第二次结算（settlements.command_id 主键物理兜底）；
-//   - 未填写截止时刻，或数据库时钟尚未到达截止点 → ErrDeadlineNotReached，
+//   - 未填写截止时刻，或裁决时刻尚未到达截止点 → ErrDeadlineNotReached，
 //     状态不变；
 //   - 否则写入 result='expired' 的结算行（无代次、无令牌——expired 不伪造
 //     任何回执），翻转状态并传播阻断，全部在单事务内提交。
@@ -464,13 +493,14 @@ func (s *Store) Expire(ctx context.Context, id int64) error {
 	}
 	defer tx.Rollback(ctx)
 
+	// 首步即取指令行锁：与任何在途的领取/回执/到期/创建事务串行化。
 	var status string
-	var deadlineReached bool
+	var deadlineAt *time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT status, (deadline_at IS NOT NULL AND deadline_at <= now())
+		SELECT status, deadline_at
 		FROM commands
 		WHERE id = $1
-		FOR UPDATE`, id).Scan(&status, &deadlineReached)
+		FOR UPDATE`, id).Scan(&status, &deadlineAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrCommandNotFound
 	}
@@ -478,25 +508,34 @@ func (s *Store) Expire(ctx context.Context, id int64) error {
 		return fmt.Errorf("expire load command: %w", err)
 	}
 
+	// 裁决时刻：拿到行锁之后的数据库真实时钟。不能用事务开始时钟 now()——
+	// 它冻结在 BEGIN 时刻，会把锁等待期间已经跨过截止点的请求按入队时刻
+	// 误判为“尚未到期”。
+	var adjudgedAt time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&adjudgedAt); err != nil {
+		return fmt.Errorf("expire adjudication clock: %w", err)
+	}
+
 	if status != StatusPending {
 		return ErrAlreadySettled
 	}
-	if !deadlineReached {
+	if deadlineAt == nil || deadlineAt.After(adjudgedAt) {
 		return ErrDeadlineNotReached
 	}
 
 	// 到期结算是正式结算（settlements 恰一行），但不来自任何租约令牌：
 	// generation/lease_token 置 NULL，由迁移中的 CHECK 约束强制该契约。
+	// settled_at 记录本次裁决时刻，与详情视图呈现同一次有效裁决。
 	if _, err = tx.Exec(ctx, `
-		INSERT INTO settlements (command_id, generation, lease_token, result)
-		VALUES ($1, NULL, NULL, 'expired')`, id); err != nil {
+		INSERT INTO settlements (command_id, generation, lease_token, result, settled_at)
+		VALUES ($1, NULL, NULL, 'expired', $2)`, id, adjudgedAt); err != nil {
 		return fmt.Errorf("expire settlement insert: %w", err)
 	}
 
 	if _, err = tx.Exec(ctx, `
 		UPDATE commands
-		SET status = 'expired', updated_at = now()
-		WHERE id = $1 AND status = 'pending'`, id); err != nil {
+		SET status = 'expired', updated_at = $2
+		WHERE id = $1 AND status = 'pending'`, id, adjudgedAt); err != nil {
 		return fmt.Errorf("expire status update: %w", err)
 	}
 
@@ -510,9 +549,9 @@ func (s *Store) Expire(ctx context.Context, id int64) error {
 			SELECT c.id FROM commands c JOIN descendants d ON c.predecessor_id = d.did
 		)
 		UPDATE commands
-		SET status = 'blocked', blocked_by = $1, updated_at = now()
+		SET status = 'blocked', blocked_by = $1, updated_at = $2
 		WHERE id IN (SELECT did FROM descendants)
-		  AND status = 'pending'`, id); err != nil {
+		  AND status = 'pending'`, id, adjudgedAt); err != nil {
 		return fmt.Errorf("expire block propagation: %w", err)
 	}
 
