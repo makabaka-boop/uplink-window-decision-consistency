@@ -216,9 +216,9 @@ func TestExpireAtDeadlineSettlesOnce(t *testing.T) {
 }
 
 // TestExpireExactBoundaryPredicates 精确边界语义：
-// 当 deadline_at 取“过去事务的 now()”时，后续事务的数据库时钟必已到达截止点
-// （事务时间戳单调），到期谓词 deadline_at <= now() 成立；回执谓词 deadline_at > now()
-// 不成立。无需睡眠即可确定性地覆盖 == 边界。
+// 当 deadline_at 取“过去事务的 now()”时，后续语句的数据库时钟必已越过截止点
+// （时钟单调前进），到期谓词 deadline_at <= clock_timestamp() 成立；
+// 回执谓词 deadline_at > clock_timestamp() 不成立。无需睡眠即可确定性地覆盖 == 边界。
 func TestExpireExactBoundaryPredicates(t *testing.T) {
 	pool, _ := openTestDB(t)
 	st := store.New(pool)
@@ -557,5 +557,119 @@ func TestExpiredPersistsAcrossRestart(t *testing.T) {
 	}
 	if _, err := st2.Claim(ctx, time.Second); !errors.Is(err, store.ErrNoAvailableCommand) {
 		t.Fatalf("expired chain claimable after restart: %v", err)
+	}
+}
+
+// holdRowLock 以“旁观者”事务持有指定指令的行锁，模拟回执/到期结算在
+// FOR UPDATE 上排队等待的交接；返回的 release 提交旁观者事务、释放行锁。
+func holdRowLock(t *testing.T, pool *pgxpool.Pool, id int64) (release func()) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM commands WHERE id=$1 FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		if err := tx.Commit(ctx); err != nil {
+			t.Errorf("release row lock: %v", err)
+		}
+	}
+}
+
+// TestVerdictAfterLockWaitCrossingBoundary 回归：请求开始时尚未过窗，但在指令
+// 行锁上排队等待期间跨过了时间边界——裁决必须以“拿到行锁、实际处理的那一刻”的
+// 数据库时钟（clock_timestamp()）为准，与请求的等待顺序无关：
+//   - 回执在锁等待期间跨过执行截止点 → ErrDeadlineReached，状态不变，
+//     随后到期结算接管为 expired（同一交接只呈现一次有效裁决）；
+//   - 到期结算在锁等待期间跨过截止点 → 必须落 expired，绝不能报“尚未到期”；
+//   - 回执在锁等待期间跨过租约到期点 → ErrLeaseStale，状态不变；
+//   - 详情视图的时间线与裁决一致：expired 的 settled_at 不早于截止点。
+//
+// 若裁决谓词退回事务开始即冻结的 now()，本测试三个场景会分别退化为：
+// 过窗指令被送达、过窗指令被告知 deadline_not_reached、已失效租约被接受。
+func TestVerdictAfterLockWaitCrossingBoundary(t *testing.T) {
+	pool, _ := openTestDB(t)
+	st := store.New(pool)
+	ctx := context.Background()
+
+	// —— 场景一：回执在锁等待期间跨过执行截止点 ——
+	deadline := dbNow(t, pool).Add(400 * time.Millisecond)
+	c := createWithDeadline(t, st, `{"case":"ack-deadline"}`, deadline)
+	cl, err := st.Claim(ctx, 5*time.Second)
+	if err != nil || cl.CommandID != c.ID {
+		t.Fatalf("claim: %+v %v", cl, err)
+	}
+	release := holdRowLock(t, pool, c.ID)
+	ackErr := make(chan error, 1)
+	go func() { ackErr <- st.Ack(ctx, c.ID, cl.LeaseToken, store.StatusDelivered) }()
+	time.Sleep(150 * time.Millisecond) // 回执事务已开始（尚未过窗）并在行锁上排队
+	time.Sleep(400 * time.Millisecond) // 锁等待期间跨过截止点（~550ms > 400ms）
+	release()
+	if err := <-ackErr; !errors.Is(err, store.ErrDeadlineReached) {
+		t.Fatalf("ack crossing deadline during lock wait: want ErrDeadlineReached, got %v", err)
+	}
+	d, _ := st.GetCommand(ctx, c.ID)
+	if d.Status != store.StatusPending || d.Settlement != nil {
+		t.Fatalf("rejected ack changed state: %+v", d)
+	}
+	// 同一交接下的到期结算随后接管：expired，且结算时刻不早于截止点（时间线可对账）。
+	if err := st.Expire(ctx, c.ID); err != nil {
+		t.Fatalf("expire after queued ack: %v", err)
+	}
+	d, _ = st.GetCommand(ctx, c.ID)
+	if d.Status != store.StatusExpired || d.Settlement == nil ||
+		d.Settlement.Result != store.StatusExpired || d.Settlement.Generation != nil {
+		t.Fatalf("want expired settlement without receipt, got %+v", d)
+	}
+	if d.Settlement.SettledAt.Before(deadline) {
+		t.Fatalf("expired settled_at %v predates deadline %v: timeline not reconcilable",
+			d.Settlement.SettledAt, deadline)
+	}
+
+	// —— 场景二：到期结算在锁等待期间跨过截止点，绝不能被告知“尚未到期” ——
+	deadline2 := dbNow(t, pool).Add(400 * time.Millisecond)
+	c2 := createWithDeadline(t, st, `{"case":"expire-deadline"}`, deadline2)
+	release2 := holdRowLock(t, pool, c2.ID)
+	expErr := make(chan error, 1)
+	go func() { expErr <- st.Expire(ctx, c2.ID) }()
+	time.Sleep(150 * time.Millisecond) // 到期结算事务已开始（尚未到点）并在行锁上排队
+	time.Sleep(400 * time.Millisecond) // 锁等待期间跨过截止点
+	release2()
+	if err := <-expErr; err != nil {
+		t.Fatalf("expire crossing deadline during lock wait must settle, got %v", err)
+	}
+	d2, _ := st.GetCommand(ctx, c2.ID)
+	if d2.Status != store.StatusExpired || d2.Settlement == nil ||
+		d2.Settlement.Result != store.StatusExpired {
+		t.Fatalf("queued expire must settle expired, got %+v", d2)
+	}
+	if d2.Settlement.SettledAt.Before(deadline2) {
+		t.Fatalf("expired settled_at %v predates deadline %v", d2.Settlement.SettledAt, deadline2)
+	}
+
+	// —— 场景三：回执在锁等待期间跨过租约到期点 ——
+	c3, err := st.CreateCommand(ctx, []byte(`{"case":"ack-lease"}`), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl3, err := st.Claim(ctx, 200*time.Millisecond)
+	if err != nil || cl3.CommandID != c3.ID {
+		t.Fatalf("claim c3: %+v %v", cl3, err)
+	}
+	release3 := holdRowLock(t, pool, c3.ID)
+	ackErr3 := make(chan error, 1)
+	go func() { ackErr3 <- st.Ack(ctx, c3.ID, cl3.LeaseToken, store.StatusDelivered) }()
+	time.Sleep(150 * time.Millisecond) // 回执事务开始时租约仍有效，并在行锁上排队
+	time.Sleep(300 * time.Millisecond) // 锁等待期间租约到期（~450ms > 200ms）
+	release3()
+	if err := <-ackErr3; !errors.Is(err, store.ErrLeaseStale) {
+		t.Fatalf("ack crossing lease expiry during lock wait: want ErrLeaseStale, got %v", err)
+	}
+	d3, _ := st.GetCommand(ctx, c3.ID)
+	if d3.Status != store.StatusPending || d3.Settlement != nil {
+		t.Fatalf("expired-lease ack changed state: %+v", d3)
 	}
 }

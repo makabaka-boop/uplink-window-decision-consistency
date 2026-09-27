@@ -11,7 +11,8 @@
 //     或“待处理且已结算”的组合；失败传播期间下游不呈现虚假可执行状态；
 //  7. 实例时钟偏移：两台时钟分别偏移 ±1 小时的实例对同一凭证给出相同裁决；
 //  8. 执行截止时刻：过窗跳过领取、截止后回执/到期结算互斥、expired 无回执结算、
-//     后继阻断、重复结算不产生第二行、重启保持。
+//     后继阻断、重复结算不产生第二行、锁等待跨过时间边界时裁决仍按拿到行锁的
+//     真实时刻落地、重启保持。
 //
 // 退出码 0 表示全部通过；任何断言失败都会打印详细错误并以非零退出。
 package main
@@ -986,6 +987,9 @@ func (v *verifier) checkClockSkewAcrossInstances(ctx context.Context) error {
 //   - 截止后持未到期租约的回执 409 deadline_reached；截止前送达不可被到期结算追改；
 //   - 到点到期结算原子置 expired、无回执结算（generation=null）、尚未送达后继
 //     原子 blocked（根因=到期根）；重复到期不制造第二次结算；
+//   - 锁等待跨过时间边界的交接：请求开始时未过窗、在指令行锁上排队期间过窗的
+//     回执必须 409 deadline_reached，同样交错的到期结算必须落 expired（而非
+//     409 deadline_not_reached）——裁决以拿到行锁的真实时刻为准，与等待顺序无关；
 //   - 重启（新进程同库）后 expired/blocked 保持；带外核对结算恰一行；
 //   - 领取与到期结算的并发互斥（可选，行锁裁决只允许一个终态）。
 func (v *verifier) checkDeadlines(ctx context.Context) error {
@@ -1176,6 +1180,89 @@ func (v *verifier) checkDeadlines(ctx context.Context) error {
 	}
 	if got := v.getCommand(ctx, fast.ID); got.Status != "delivered" {
 		return fail("pre-deadline delivery overturned: %s", got.Status)
+	}
+
+	// 7b) 锁等待跨过时间边界：请求开始时尚未过窗，但在指令行锁上排队等待期间
+	// 跨过截止点——裁决必须按拿到行锁、实际处理那一刻的数据库时钟落地，
+	// 与请求的等待顺序无关。用直连数据库的“旁观者”行锁制造确定的排队交接。
+	dbPool, err := pgxpool.New(ctx, v.dbURL)
+	if err != nil {
+		return fmt.Errorf("db connect for lock-wait boundary: %w", err)
+	}
+	defer dbPool.Close()
+	dbNow := func() time.Time {
+		var n time.Time
+		if err := dbPool.QueryRow(ctx, `SELECT now()`).Scan(&n); err != nil {
+			fatal(fmt.Errorf("db now: %w", err))
+		}
+		return n
+	}
+	holdLock := func(id int64) func() {
+		tx, err := dbPool.Begin(ctx)
+		if err != nil {
+			fatal(fmt.Errorf("bystander begin: %w", err))
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM commands WHERE id=$1 FOR UPDATE`, id); err != nil {
+			fatal(fmt.Errorf("bystander lock %d: %w", id, err))
+		}
+		return func() {
+			if err := tx.Commit(ctx); err != nil {
+				fatal(fmt.Errorf("bystander release %d: %w", id, err))
+			}
+		}
+	}
+	type httpResp struct {
+		code int
+		raw  []byte
+	}
+
+	// 回执在锁等待期间跨过截止点：必须 409 deadline_reached 且状态不变，
+	// 随后到期结算接管为 expired（同一交接只呈现一次有效裁决）。
+	edge := v.createCommandWithDeadline(ctx, map[string]any{"d": "ack-lock-wait"},
+		dbNow().Add(500*time.Millisecond))
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK || decode[claimOut](raw).CommandID != edge.ID {
+		return fail("claim edge: status=%d body=%s", st, raw)
+	}
+	edgeClaim := decode[claimOut](raw)
+	release := holdLock(edge.ID)
+	ackCh := make(chan httpResp, 1)
+	go func() {
+		code, body := v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", edge.ID),
+			map[string]any{"lease_token": edgeClaim.LeaseToken, "result": "delivered"})
+		ackCh <- httpResp{code, body}
+	}()
+	time.Sleep(200 * time.Millisecond) // 回执事务已开始（尚未过窗）并在行锁上排队
+	time.Sleep(500 * time.Millisecond) // 锁等待期间跨过截止点（~700ms > 500ms）
+	release()
+	if ar := <-ackCh; ar.code != http.StatusConflict ||
+		decode[apiError](ar.raw).Error.Code != "deadline_reached" {
+		return fail("lock-wait ack crossing deadline: status=%d body=%s", ar.code, ar.raw)
+	}
+	if got := v.getCommand(ctx, edge.ID); got.Status != "pending" || got.Settlement != nil {
+		return fail("lock-wait ack changed state: %+v", got)
+	}
+	if st, raw = post(edge.ID, "expire"); st != http.StatusOK ||
+		decode[commandOut](raw).Status != "expired" {
+		return fail("expire after lock-wait ack: status=%d body=%s", st, raw)
+	}
+
+	// 到期结算在锁等待期间跨过截止点：必须落 expired，绝不能 409 deadline_not_reached。
+	edge2 := v.createCommandWithDeadline(ctx, map[string]any{"d": "expire-lock-wait"},
+		dbNow().Add(500*time.Millisecond))
+	release2 := holdLock(edge2.ID)
+	expCh := make(chan httpResp, 1)
+	go func() {
+		code, body := post(edge2.ID, "expire")
+		expCh <- httpResp{code, body}
+	}()
+	time.Sleep(200 * time.Millisecond) // 到期结算事务已开始（尚未到点）并在行锁上排队
+	time.Sleep(500 * time.Millisecond) // 锁等待期间跨过截止点
+	release2()
+	if er := <-expCh; er.code != http.StatusOK ||
+		decode[commandOut](er.raw).Status != "expired" {
+		return fail("lock-wait expire crossing deadline must settle expired: status=%d body=%s",
+			er.code, er.raw)
 	}
 
 	// 8) 重启后终态保持，重复到期仍 409，不可领取。
